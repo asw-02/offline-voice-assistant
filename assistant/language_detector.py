@@ -1,63 +1,116 @@
-"""
-Dual-Vosk language detector.
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-Loads both configured Vosk models and runs a short WAV sample through
-each recognizer, comparing average word confidence to pick the best language.
+"""
+Language detection using dual Vosk models.
+
+Since Vosk has no built-in language detection, this module runs
+a short audio sample through both the English and German models
+and picks the one with higher word-level confidence.
 """
 
-import json
-import wave
 from pathlib import Path
-from typing import Tuple
-
-from vosk import Model, KaldiRecognizer
 
 import config
 
 
 class LanguageDetector:
-    def __init__(self):
-        self._models = {}
+    """Detects spoken language by comparing Vosk model confidence scores."""
 
-    def _load(self, lang: str) -> Model:
-        if lang in self._models:
-            return self._models[lang]
-        path = config.VOSK_MODEL_PATHS.get(lang)
-        if not path:
-            raise ValueError(f"No Vosk model configured for '{lang}'")
-        print(f"[LANG] Loading Vosk model for {lang}...")
-        m = Model(path)
-        self._models[lang] = m
-        return m
+    def __init__(self, transcriber):
+        """
+        Args:
+            transcriber: A Transcriber instance (shared, provides model loading).
+        """
+        self._transcriber = transcriber
+        self._last_language = config.DEFAULT_LANGUAGE
 
-    def detect(self, wav_path: Path) -> Tuple[str, float]:
-        """Return (language, confidence) for the provided WAV file."""
-        wav_path = Path(wav_path)
-        if not wav_path.exists():
-            return config.DEFAULT_LANGUAGE, 0.0
+        # Pre-load both models
+        print("[LANG] Loading language detection models...")
+        for lang in config.SUPPORTED_LANGUAGES:
+            try:
+                self._transcriber.load_model(lang)
+            except FileNotFoundError as e:
+                print(f"  [!!] {e}")
 
-        # Read only a short prefix for speed
-        with wave.open(str(wav_path), "rb") as wf:
-            fr = wf.getframerate()
-            frames = int(fr * config.LANG_DETECT_SECONDS)
-            data = wf.readframes(frames)
+        print("  [OK] Language detection ready")
 
-        best_lang = config.DEFAULT_LANGUAGE
-        best_conf = 0.0
+    def detect(self, wav_path=config.OUTPUT_WAV):
+        """
+        Detect the language of a recorded WAV file.
+
+        Runs the audio through both EN and DE Vosk models and
+        compares average word-level confidence scores.
+
+        Args:
+            wav_path: Path to the WAV file to analyze.
+
+        Returns:
+            Tuple of (language_code, confidence).
+        """
+        if not Path(wav_path).exists():
+            return self._last_language, 0.0
+
+        results = {}
 
         for lang in config.SUPPORTED_LANGUAGES:
-            model = self._load(lang)
-            rec = KaldiRecognizer(model, fr)
-            rec.AcceptWaveform(data)
-            j = json.loads(rec.Result())
-            text = j.get("text", "")
-            confs = [float(w.get("conf", 0.0)) for w in j.get("result", [])]
-            conf = float(sum(confs) / len(confs)) if confs else 0.0
+            try:
+                text, confidence = self._transcriber.transcribe_wav_with_confidence(
+                    wav_path, lang
+                )
+                results[lang] = {
+                    "text": text,
+                    "confidence": confidence,
+                    "word_count": len(text.split()) if text else 0,
+                }
+            except Exception as exc:
+                print(f"  [!!] Language detection error for '{lang}': {exc}")
+                results[lang] = {"text": "", "confidence": 0.0, "word_count": 0}
 
-            # prefer non-empty text with higher confidence
-            score = conf if text.strip() else conf * 0.5
-            if score > best_conf:
-                best_conf = score
+        # Pick the language with the best combination of confidence and word count
+        best_lang = self._last_language
+        best_score = -1.0
+
+        for lang, result in results.items():
+            # Score = confidence * word_count_factor
+            # More recognized words with high confidence = better match
+            word_factor = min(result["word_count"] / 3.0, 1.0)  # Cap at 3 words
+            score = result["confidence"] * (0.5 + 0.5 * word_factor)
+
+            if score > best_score and result["text"]:
+                best_score = score
                 best_lang = lang
 
+        self._last_language = best_lang
+
+        best_conf = results.get(best_lang, {}).get("confidence", 0.0)
         return best_lang, best_conf
+
+    def detect_with_details(self, wav_path=config.OUTPUT_WAV):
+        """
+        Detect language with full details for debugging.
+
+        Returns:
+            Dictionary with per-language results.
+        """
+        results = {}
+
+        for lang in config.SUPPORTED_LANGUAGES:
+            try:
+                text, confidence = self._transcriber.transcribe_wav_with_confidence(
+                    wav_path, lang
+                )
+                results[lang] = {
+                    "text": text,
+                    "confidence": confidence,
+                    "word_count": len(text.split()) if text else 0,
+                }
+            except Exception:
+                results[lang] = {"text": "", "confidence": 0.0, "word_count": 0}
+
+        return results
+
+    @property
+    def last_language(self):
+        """Return the last detected language."""
+        return self._last_language
