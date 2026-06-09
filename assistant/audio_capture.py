@@ -1,15 +1,19 @@
-"""
-RMS-based microphone capture for Raspberry Pi.
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-Provides `listen_for_speech()` which records to a WAV file
-using a simple RMS-start / RMS-silence detector adapted from the
-reference project.
+"""
+Microphone audio capture with RMS-based Voice Activity Detection.
+
+Adapted from the reference alarm project:
+  voice_control/qwen_assistant.py -> record_until_silence()
+
+Uses sounddevice InputStream with an adaptive noise floor.
+No ML model required — purely amplitude-based detection.
 """
 
+import queue
 import time
 import wave
-from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import sounddevice as sd
@@ -17,115 +21,172 @@ import sounddevice as sd
 import config
 
 
-def _rms_from_int16(block: np.ndarray) -> float:
-    """Calculate RMS from int16 audio block."""
-    if block is None or len(block) == 0:
-        return 0.0
-    arr = block.astype(np.float32)
-    return float(np.sqrt(np.mean((arr / 32768.0) ** 2)))
-
-
 class AudioCapture:
-    """Capture audio from the default (or configured) microphone.
+    """Captures speech from the microphone using RMS-based VAD."""
 
-    listen_for_speech() records into `config.OUTPUT_WAV` and returns
-    the Path to the written WAV file, or None on timeout/short audio.
-    """
+    def __init__(
+        self,
+        mic_device=config.MIC_DEVICE,
+        sample_rate=config.SAMPLE_RATE,
+        channels=config.CHANNELS,
+        blocksize=config.BLOCKSIZE,
+    ):
+        self._mic_device = mic_device
+        self._sample_rate = sample_rate
+        self._channels = channels
+        self._blocksize = blocksize
 
-    def __init__(self):
-        self.sample_rate = config.SAMPLE_RATE
-        self.channels = config.CHANNELS
-        self.blocksize = config.BLOCKSIZE
-        self.mic_device = config.MIC_DEVICE
+        # Verify microphone is accessible
+        try:
+            sd.check_input_settings(
+                device=self._mic_device,
+                channels=self._channels,
+                samplerate=self._sample_rate,
+            )
+            print("[MIC] Microphone OK")
+        except Exception as exc:
+            print(f"[!!] Microphone check failed: {exc}")
+            raise
 
-    def listen_for_speech(self) -> Optional[Path]:
-        """Listen until speech is detected and ends; write WAV and return Path."""
-        start_threshold = config.START_RMS
-        stop_threshold = config.STOP_RMS
-        silence_seconds = config.SILENCE_SECONDS
-        min_seconds = config.MIN_RECORD_SECONDS
-        timeout = config.LISTEN_TIMEOUT_SECONDS
+    @staticmethod
+    def calculate_rms(audio_block):
+        """Calculate Root Mean Square of an audio block."""
+        audio_float = audio_block.astype(np.float32)
+        return float(np.sqrt(np.mean(audio_float ** 2)))
 
-        frames: list[bytes] = []
+    def record_until_silence(self, filename=config.OUTPUT_WAV):
+        """
+        Record from microphone until speech is detected and then silence follows.
+
+        Adapted from reference project's record_until_silence().
+
+        Returns:
+            True if speech was captured and saved to WAV, False otherwise.
+        """
+        print("\n[MIC] Listening...")
+
+        recorded_blocks = []
+        speech_started = False
+        input_queue = queue.Queue(maxsize=80)
+        input_overflows = 0
+        dropped_blocks = 0
+
+        start_time = time.monotonic()
+        speech_start_time = None
+        last_voice_time = start_time
+        noise_rms = min(config.START_RMS, config.STOP_RMS) / 2.0
+
+        def audio_callback(indata, frames, time_info, status):
+            nonlocal dropped_blocks, input_overflows
+
+            if status:
+                input_overflows += 1
+
+            try:
+                input_queue.put_nowait(indata.copy())
+            except queue.Full:
+                dropped_blocks += 1
+                try:
+                    input_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    input_queue.put_nowait(indata.copy())
+                except queue.Full:
+                    pass
 
         try:
-            with sd.RawInputStream(
-                samplerate=self.sample_rate,
-                blocksize=self.blocksize,
+            with sd.InputStream(
+                device=self._mic_device,
+                samplerate=self._sample_rate,
+                channels=self._channels,
                 dtype="int16",
-                channels=self.channels,
-                device=self.mic_device,
-            ) as stream:
-
-                print("[LISTEN] Waiting for speech...")
-                # Estimate noise floor from a brief initial sample
-                noise_samples = []
-                noise_start = time.time()
-                while time.time() - noise_start < 0.5:
-                    data, _ = stream.read(self.blocksize)
-                    noise_samples.append(np.frombuffer(data, dtype=np.int16))
-                noise_rms = np.mean([_rms_from_int16(s) for s in noise_samples])
-                start_rms = max(start_threshold / 32768.0, noise_rms * 3.0)
-                stop_rms = max(stop_threshold / 32768.0, noise_rms * 1.8)
-
-                # Wait for speech start
-                started = False
-                speech_start_time = None
-                silence_start_time = None
-                overall_start = time.time()
-
+                blocksize=self._blocksize,
+                latency="high",
+                callback=audio_callback,
+            ):
                 while True:
-                    if time.time() - overall_start > timeout:
-                        print("[LISTEN] Timeout waiting for speech")
-                        return None
+                    try:
+                        audio_block = input_queue.get(timeout=0.2)
+                    except queue.Empty:
+                        continue
 
-                    data, _ = stream.read(self.blocksize)
-                    block = np.frombuffer(data, dtype=np.int16)
-                    rms = _rms_from_int16(block)
+                    if input_overflows:
+                        print(f"[MIC] Audio overflow ({input_overflows}x)")
+                        input_overflows = 0
 
-                    if not started:
-                        if rms >= start_rms:
-                            started = True
-                            speech_start_time = time.time()
-                            frames.append(data)
-                            silence_start_time = None
-                            print("[LISTEN] Speech started")
+                    if dropped_blocks:
+                        print(f"[MIC] Buffer full, {dropped_blocks} block(s) dropped")
+                        dropped_blocks = 0
+
+                    rms = self.calculate_rms(audio_block.reshape(-1))
+                    now = time.monotonic()
+                    recorded_blocks.append(audio_block.copy())
+
+                    start_threshold = max(config.START_RMS, noise_rms * 3.0)
+                    stop_threshold = max(config.STOP_RMS, noise_rms * 1.8)
+
+                    if not speech_started:
+                        if rms >= start_threshold:
+                            speech_started = True
+                            speech_start_time = now
+                            last_voice_time = now
+                            print("[MIC] Speech detected, recording...")
                         else:
-                            # keep waiting
+                            # Adapt noise floor
+                            noise_rms = (noise_rms * 0.95) + (rms * 0.05)
+                            if now - start_time >= config.LISTEN_TIMEOUT_SECONDS:
+                                print("[MIC] No speech detected (timeout)")
+                                return False
                             continue
                     else:
-                        frames.append(data)
-                        if rms < stop_rms:
-                            if silence_start_time is None:
-                                silence_start_time = time.time()
-                            elif time.time() - silence_start_time >= silence_seconds:
-                                # finished
-                                break
-                        else:
-                            silence_start_time = None
+                        if rms >= stop_threshold:
+                            last_voice_time = now
 
-                # Validate minimum duration
-                if speech_start_time is None:
-                    return None
-                duration = time.time() - speech_start_time
-                if duration < min_seconds:
-                    print("[LISTEN] Speech too short")
-                    return None
+                        silence_duration = now - last_voice_time
+                        record_duration = now - speech_start_time
 
-                # Write WAV file (16-bit PCM)
-                out_path = Path(config.OUTPUT_WAV)
-                with wave.open(str(out_path), "wb") as wf:
-                    wf.setnchannels(self.channels)
-                    wf.setsampwidth(2)
-                    wf.setframerate(self.sample_rate)
-                    wf.writeframes(b"".join(frames))
+                        if (
+                            silence_duration >= config.SILENCE_SECONDS
+                            and record_duration >= config.MIN_RECORD_SECONDS
+                        ):
+                            print("[MIC] Silence detected, recording stopped")
+                            break
 
-                print(f"[LISTEN] Recorded {duration:.2f}s -> {out_path}")
-                return out_path
+        except Exception as exc:
+            print(f"[!!] Recording error: {exc}")
+            return False
 
-        except Exception as e:
-            print(f"  [!!] Audio capture error: {e}")
-            return None
+        if not speech_started or not recorded_blocks:
+            print("[MIC] No speech detected")
+            return False
 
-    def cleanup(self) -> None:
-        pass
+        # Concatenate and save as WAV
+        audio = np.concatenate(recorded_blocks, axis=0)
+
+        try:
+            with wave.open(filename, "wb") as wf:
+                wf.setnchannels(self._channels)
+                wf.setsampwidth(2)  # 16-bit
+                wf.setframerate(self._sample_rate)
+                wf.writeframes(audio.tobytes())
+            return True
+        except Exception as exc:
+            print(f"[!!] Error saving WAV: {exc}")
+            return False
+
+    def listen_for_speech(self):
+        """Listen for speech and return the Path to the recorded WAV, or None.
+
+        This is the high-level API used by main.py.
+        """
+        from pathlib import Path
+
+        success = self.record_until_silence(config.OUTPUT_WAV)
+        if success:
+            return Path(config.OUTPUT_WAV)
+        return None
+
+    def cleanup(self):
+        """Release audio resources."""
+        print("[MIC] Audio resources released")
