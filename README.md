@@ -1,75 +1,54 @@
-# 🎙️ Offline Speech Assistant
+# 🎙️ Offline Speech Assistant — Raspberry Pi 5
 
-A fully offline, privacy-first voice assistant powered by **Whisper**, **Ollama**, and **Piper TTS**. Supports **English** and **German** with automatic language detection.
+A fully offline, privacy-first voice assistant for **Raspberry Pi 5** powered by **Vosk**, **Ollama**, and **Piper TTS**. Supports **English** and **German** with automatic language detection.
 
 ```
-🎤 Microphone → Silero VAD → faster-whisper (STT + Lang) → Ollama LLM → Piper TTS → 🔊 Speaker
+🎤 Microphone → RMS VAD → Vosk STT (EN + DE) → Ollama LLM → Piper TTS → 🔊 Speaker
 ```
 
 ## Features
 
-- **100% Offline** — No data leaves your machine after initial model downloads
+- **100% Offline** — No data leaves your device after initial model downloads
 - **Bilingual** — Speaks and understands English and German
-- **Automatic Language Detection** — Detects language from your speech and responds accordingly
-- **Conversation Memory** — Remembers context within a session
-- **Voice Activity Detection** — Smart silence detection, no push-to-talk needed
-- **GPU Accelerated** — Runs on CUDA for fast transcription
+- **Automatic Language Detection** — Dual-Vosk confidence comparison picks the right language
+- **Conversation Memory** — Remembers context within a session (last 5 message pairs)
+- **RMS-based VAD** — Adaptive noise-floor detection, no push-to-talk needed
+- **Lightweight** — No PyTorch, no GPU — runs entirely on CPU
 
 ## Tech Stack
 
 | Component | Technology | Purpose |
 |---|---|---|
-| STT | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (medium) | Speech-to-Text + Language Detection |
-| LLM | [Ollama](https://ollama.com/) (qwen3.5:9b) | Local AI chat |
-| TTS | [Piper](https://github.com/rhasspy/piper) | Neural Text-to-Speech |
-| VAD | [Silero VAD](https://github.com/snakers4/silero-vad) | Voice Activity Detection |
+| STT | [Vosk](https://alphacephei.com/vosk/) (DE 0.21 + EN 0.22) | Speech-to-Text |
+| Language Detection | Dual-Vosk models | Confidence comparison across EN and DE |
+| LLM | [Ollama](https://ollama.com/) (`qwen3.5:2b`) | Local AI chat via HTTP |
+| TTS | [Piper](https://github.com/rhasspy/piper) → `aplay` | Neural Text-to-Speech |
+| VAD | RMS-based (adaptive noise floor) | Voice Activity Detection |
 
 ## Requirements
 
+- **Raspberry Pi 5** (8 GB RAM recommended)
 - **Python** 3.10+
-- **CUDA GPU** with 16GB+ VRAM (recommended)
 - **Ollama** installed and running
-- **FFmpeg** installed
-- **Microphone** connected
+- **Microphone** connected (USB or I²S)
+- **Speaker** via 3.5mm jack or HDMI
 
-## Installation
+## Quick Setup
 
-### 1. Clone and setup
 ```bash
 git clone https://github.com/asw-02/offline-voice-assistant.git
 cd offline-voice-assistant
 
-python -m venv venv
-venv\Scripts\activate        # Windows
-# source venv/bin/activate   # Linux/Mac
-
-pip install -r requirements.txt
+chmod +x scripts/setup_pi.sh
+bash scripts/setup_pi.sh
 ```
 
-### 2. Install Ollama
-Download from [ollama.com](https://ollama.com/), then:
-```bash
-ollama pull qwen3.5:9b
-```
-
-### 3. Install FFmpeg
-```bash
-# Windows (via Chocolatey)
-choco install ffmpeg
-
-# Or download from https://ffmpeg.org/download.html
-```
-
-### 4. Download Models
-```bash
-python scripts/download_models.py
-```
-
-This downloads:
-- Piper TTS binary (Windows)
-- English voice model (`en_US-lessac-medium`)
-- German voice model (`de_DE-thorsten-medium`)
-- Pre-caches Whisper and Silero VAD models
+The setup script handles everything:
+1. Installs system packages (`portaudio19-dev`, `alsa-utils`)
+2. Creates a Python virtual environment
+3. Downloads Vosk models (~3.4 GB total)
+4. Downloads Piper binary (aarch64) and voice models (EN + DE)
+5. Pulls the Ollama model (`qwen3:1.7b`)
 
 ## Usage
 
@@ -80,23 +59,9 @@ ollama serve
 
 ### Run the Assistant
 ```bash
-python main.py
-```
-
-## Raspberry Pi 5 (aarch64) Quickstart
-
-On a Raspberry Pi 5 (8GB) use the provided setup script to install system deps, create a venv, and download models:
-
-```bash
-bash scripts/setup_pi.sh
 source venv/bin/activate
-ollama serve   # if Ollama is installed
-python main.py
+python3 main.py
 ```
-
-Notes:
-- This build uses Vosk for STT, an RMS-based VAD, Ollama via HTTP, and Piper piped to `aplay` for TTS.
-- Recommended Ollama model: `qwen3.5:2b` for 8GB RAM. `qwen3.5:9b` is too large for the Pi.
 
 ### Voice Commands
 - Say **"reset"** or **"zurücksetzen"** — Clear conversation history
@@ -109,32 +74,46 @@ Edit `config.py` to tune:
 
 | Setting | Default | Description |
 |---|---|---|
-| `WHISPER_MODEL_SIZE` | `medium` | Whisper model (`tiny`/`base`/`small`/`medium`/`large-v3`) |
-| `WHISPER_DEVICE` | `cuda` | `cuda` for GPU, `cpu` for CPU |
-| `OLLAMA_MODEL` | `qwen3.5:9b` | Any Ollama model |
-| `VAD_THRESHOLD` | `0.5` | Speech detection sensitivity (0-1) |
-| `SILENCE_DURATION` | `1.5` | Seconds of silence before processing |
-| `MAX_CONVERSATION_HISTORY` | `10` | Message pairs to remember |
+| `MIC_DEVICE` | `None` (system default) | Microphone device index |
+| `START_RMS` / `STOP_RMS` | `300` / `200` | RMS thresholds for speech detection |
+| `SILENCE_SECONDS` | `1.5` | Seconds of silence before processing |
+| `OLLAMA_MODEL` | `qwen3.5:2b` | Any Ollama model |
+| `MAX_CONVERSATION_HISTORY` | `5` | Message pairs to remember |
+| `LANG_DETECT_SECONDS` | `3.0` | Audio prefix used for language detection |
 
 ## Project Structure
 
 ```
 offline_speech_assistent/
-├── main.py                     # Entry point
-├── config.py                   # All configuration
-├── requirements.txt            # Python dependencies
+├── main.py                     # Entry point — orchestrates the pipeline
+├── config.py                   # All configuration (paths, thresholds, models)
+├── requirements.txt            # Python deps: vosk, sounddevice, numpy, requests
 ├── assistant/
-│   ├── audio_capture.py        # Microphone + Silero VAD
-│   ├── language_detector.py    # EN/DE language detection
-│   ├── transcriber.py          # faster-whisper STT
-│   ├── llm_client.py           # Ollama integration
-│   ├── tts_engine.py           # Piper TTS wrapper
-│   └── audio_player.py         # WAV playback
-├── models/piper/               # Voice model files
-├── tools/piper/                # Piper binary
+│   ├── __init__.py
+│   ├── audio_capture.py        # RMS-based VAD microphone capture
+│   ├── language_detector.py    # Dual-Vosk language detection
+│   ├── transcriber.py          # Vosk WAV transcription
+│   ├── llm_client.py           # Ollama HTTP client
+│   ├── tts_engine.py           # Piper → aplay pipe
+│   └── speech_format.py        # German text formatting for TTS
+├── models/
+│   ├── vosk-model-de-0.21/     # German Vosk model (~1.6 GB)
+│   ├── vosk-model-en-us-0.22/  # English Vosk model (~1.8 GB)
+│   └── piper/                  # Piper voice .onnx files
+├── tools/piper/                # Piper binary (aarch64)
 └── scripts/
-    └── download_models.py      # Model downloader
+    └── setup_pi.sh             # One-shot Pi setup script
 ```
+
+## RAM Budget (Pi 5, 8 GB)
+
+| Component | Approximate Usage |
+|---|---|
+| Vosk DE model | ~1.6 GB |
+| Vosk EN model | ~1.8 GB |
+| Ollama (qwen3.5:2b) | ~1.5 GB |
+| Python + Piper | ~0.3 GB |
+| **Total** | **~5.2 GB** |
 
 ## License
 
