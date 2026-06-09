@@ -7,9 +7,12 @@ __pycache__/
 dist/
 build/
 
-# Models (large files — download via script)
+# Models (large files — download via setup_pi.sh)
+models/vosk-model-*/
 models/piper/*.onnx
 models/piper/*.onnx.json
+
+# Piper binary
 tools/piper/
 
 # Temp files
